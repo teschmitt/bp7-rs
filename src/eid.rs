@@ -15,26 +15,39 @@ use thiserror::Error;
 const ENDPOINT_URI_SCHEME_DTN: u8 = 1;
 const ENDPOINT_URI_SCHEME_IPN: u8 = 2;
 
+const IPN_LOCALNODE_NODE: u64 = 4294967295;
+const IPN_LOCALNODE_NODE_STR: &str = "4294967295";
+
 #[deprecated(note = "Please use EndpointID::none() instead")]
 pub const DTN_NONE: EndpointID = EndpointID::DtnNone(ENDPOINT_URI_SCHEME_DTN, 0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct IpnAddress(u64, u64);
+pub struct IpnAddress(u64, u64, u64);
 
 impl IpnAddress {
-    pub fn new(node: u64, service: u64) -> IpnAddress {
-        IpnAddress(node, service)
+    pub fn new(allocator: u64, node: u64, service: u64) -> IpnAddress {
+        IpnAddress(allocator, node, service)
     }
-    pub fn node_number(&self) -> u64 {
+
+    pub fn allocator_identifier(&self) -> u64 {
         self.0
     }
-    pub fn service_number(&self) -> u64 {
+
+    pub fn node_number(&self) -> u64 {
         self.1
+    }
+
+    pub fn service_number(&self) -> u64 {
+        self.2
+    }
+
+    pub fn is_local_node(&self) -> bool {
+        self.node_number() == IPN_LOCALNODE_NODE
     }
 }
 impl fmt::Display for IpnAddress {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{}", self.0, self.1)
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
     }
 }
 
@@ -79,6 +92,8 @@ pub enum EndpointIdError {
     InvalidNodeNumber(u64),
     #[error("wrong number of fields for ipn address, found `{0}` expected `2`")]
     WrongNumberOfFieldsInIpn(usize),
+    #[error("LocalNode must have default allocator and non-zero service number `{0}`")]
+    InvalidLocalNodeUri(String),
     #[error("invalid service endpoint `{0}`")]
     InvalidService(String),
     #[error("none endpoint can not have a service")]
@@ -242,8 +257,8 @@ impl EndpointID {
     /// include an application agents endpoint, e.g., 'ipn:23.42'
     ///
     /// **host must be > 0**
-    pub fn with_ipn(host: u64, endpoint: u64) -> Result<EndpointID, EndpointIdError> {
-        let addr = IpnAddress::new(host, endpoint);
+        pub fn with_ipn(allocator: u64, node: u64, endpoint: u64) -> Result<EndpointID, EndpointIdError> {
+        let addr = IpnAddress::new(allocator, node, endpoint);
         let eid = EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, addr);
         if let Err(err) = eid.validate() {
             Err(err)
@@ -263,13 +278,13 @@ impl EndpointID {
     ///
     /// // For ipn addresses
     ///
-    /// let ipn_addr_1 = EndpointID::with_ipn(23, 42).unwrap();
-    /// let ipn_addr_2 = EndpointID::with_ipn(23, 7).unwrap();
+    /// let ipn_addr_1 = EndpointID::with_ipn(978102, 23, 42).unwrap();
+    /// let ipn_addr_2 = EndpointID::with_ipn(978102, 23, 7).unwrap();
     ///
     /// assert_eq!(ipn_addr_1, ipn_addr_2.new_endpoint("42").unwrap());
     /// assert_eq!(ipn_addr_1.node_id(), Some("ipn:23.0".to_string()));
     ///
-    /// let ipn_addr_1 = EndpointID::with_ipn(23, 42).unwrap();    
+    /// let ipn_addr_1 = EndpointID::with_ipn(0, 23, 42).unwrap();
     ///
     /// assert!(ipn_addr_1.new_endpoint("-42").is_err());  
     ///
@@ -293,7 +308,7 @@ impl EndpointID {
             EndpointID::Dtn(_, _) => format!("dtn://{}/{}", self.node().unwrap(), ep).try_into(),
             EndpointID::Ipn(_, ipnaddr) => {
                 if let Ok(number) = ep.trim().parse::<u64>() {
-                    EndpointID::with_ipn(ipnaddr.node_number(), number)
+                    EndpointID::with_ipn(ipnaddr.allocator_identifier(),ipnaddr.node_number(), number)
                 } else {
                     Err(EndpointIdError::InvalidService(ep.to_owned()))
                 }
@@ -346,18 +361,23 @@ impl EndpointID {
     pub fn node_id(&self) -> Option<String> {
         match self {
             EndpointID::DtnNone(_, _) => None,
-            EndpointID::Ipn(_, ssp) => Some(format!("{}:{}.0", self.scheme(), ssp.node_number())),
+            EndpointID::Ipn(_, ssp) => Some(format!("{}:{}.0", self.scheme(), ssp.node_number())), // TODO
             EndpointID::Dtn(_, ssp) => Some(format!("{}://{}/", self.scheme(), ssp.node_name())),
         }
     }
 
-    pub fn is_node_id(&self) -> bool {
+    pub fn is_node_id(&self) -> bool { // TODO
+        self.is_administrative_endpoint()
+    }
+
+    pub fn is_administrative_endpoint(&self) -> bool {
         match self {
             EndpointID::DtnNone(_, _) => false,
             EndpointID::Dtn(_, eid) => eid.service_name().is_none(),
             EndpointID::Ipn(_, addr) => addr.service_number() == 0,
         }
     }
+
     pub fn service_name(&self) -> Option<String> {
         match self {
             EndpointID::DtnNone(_, _) => None,
@@ -389,8 +409,10 @@ impl EndpointID {
                         *code,
                         ENDPOINT_URI_SCHEME_IPN,
                     ))
-                } else if addr.node_number() < 1 {
+                } else if addr.node_number() < 1  && addr.allocator_identifier() < 1 && addr.service_number() > 0 {
                     Err(EndpointIdError::InvalidNodeNumber(addr.node_number()))
+                } else if addr.is_local_node() && (addr.service_number() < 1 || addr.allocator_identifier() > 0) {
+                    Err(EndpointIdError::InvalidLocalNodeUri(addr.to_string()))
                 } else {
                     Ok(())
                 }
@@ -441,14 +463,21 @@ impl TryFrom<&str> for EndpointID {
                 EndpointID::with_dtn(ssp)
             }
             "ipn" => {
-                let fields: Vec<&str> = items[1].split('.').collect();
-                if fields.len() != 2 {
+                let mut fields: Vec<&str> = items[1].split('.').collect();
+                if fields.len() == 2 {
+                    if fields[0] == "!" {
+                        fields[0] = IPN_LOCALNODE_NODE_STR;
+                    }
+                    fields.insert(0, "0"); // default allocator
+                }
+                if fields.len() != 3 {
                     return Err(EndpointIdError::WrongNumberOfFieldsInIpn(fields.len()));
                 }
-                let p1: u64 = fields[0].parse()?;
-                let p2: u64 = fields[1].parse()?;
 
-                EndpointID::with_ipn(p1, p2)
+                let p0: u64 = fields[0].parse()?;
+                let p1: u64 = fields[1].parse()?;
+                let p2: u64 = fields[2].parse()?;
+                EndpointID::with_ipn(p0, p1, p2)
             }
             _ => Err(EndpointIdError::UnknownScheme(items[0].to_owned())),
         }
@@ -464,7 +493,7 @@ impl TryFrom<String> for EndpointID {
 impl TryFrom<IpnAddress> for EndpointID {
     type Error = EndpointIdError;
     fn try_from(item: IpnAddress) -> Result<Self, Self::Error> {
-        EndpointID::with_ipn(item.node_number(), item.service_number())
+        EndpointID::with_ipn(item.allocator_identifier(), item.node_number(), item.service_number())
     }
 }
 
@@ -489,11 +518,16 @@ mod tests {
     #[test_case("dtn:n1/incoming" => panics "" ; "when skipping double slash for dtn")]
     #[test_case("dtn//n1/incoming" => panics "" ; "when missing URL scheme separator")]
     #[test_case("n1/incoming" => panics "" ; "when missing URL scheme")]
-    #[test_case("ipn:23.42" => "ipn:23.42" ; "when using valid ipn endpoint")]
-    #[test_case("ipn:23.0" => "ipn:23.0" ; "when using service number 0")]
+    #[test_case("ipn:977000.100.1" => "ipn:977000.100.1" ; "when using valid ipn endpoint")]
+    #[test_case("ipn:0.23.0" => "ipn:0.23.0" ; "when using service number 0")]
+    #[test_case("ipn:23.42" => "ipn:0.23.42" ; "when using valid ipn endpoint with default allocator")]
+    #[test_case("ipn:977000.4294967294.4294967295" => "ipn:977000.4294967294.4294967295" ; "when using max numbers")]
+    #[test_case("ipn:0.4294967295.1" => "ipn:0.4294967295.1" ; "when using localnode ipn uri with default allocator")]
+    #[test_case("ipn:!.3" => "ipn:0.4294967295.3" ; "when using localnode shorthand")]
+    #[test_case("ipn:!.2.3" => panics "" ; "when using localnode shorthand as allocator identifier")]
     #[test_case("ipn://23.42" => panics "" ; "when adding invalid double slash for ipn")]
     #[test_case("ipn:23.data" => panics "" ; "when providing string as service number in ipn")]
-    #[test_case("ipn:0.42" => panics "" ; "when using node number 0 in ipn")]
+    #[test_case("ipn:0.0.42" => panics "" ; "when using allocator number 0, node number 0 but service number not 0 in ipn")]
     #[test_case("dtn:none" => "dtn:none" ; "when using none endpoint")]
     #[test_case("dtn:n1/" => panics "" ; "when using dtn endpoint without double slash")]
     #[test_case("dtn:none" => EndpointID::none().to_string() ; "when providing node eid and constructed none")]
@@ -504,22 +538,26 @@ mod tests {
     #[test_case(EndpointID::DtnNone(1, 0) => true)]
     #[test_case(EndpointID::DtnNone(0, 0) => false)]
     #[test_case(EndpointID::DtnNone(1, 1) => false)]
-    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(23, 42)) => true)]
-    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_DTN, IpnAddress::new(23, 42)) => false)]
-    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(0, 0)) => false)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(0, 23, 42)) => true)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_DTN, IpnAddress::new(0, 23, 42)) => false)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(0, 0, 0)) => true)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(977123, 0, 1)) => true)] // not recommended
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(0, 0, 1)) => false)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(0, 4294967295, 0)) => false)]
+    #[test_case(EndpointID::Ipn(ENDPOINT_URI_SCHEME_IPN, IpnAddress::new(977000, 4294967295, 1)) => false)]
     fn validate_test(eid: EndpointID) -> bool {
         eid.validate().is_ok()
     }
-    #[test_case("ipn:1.0".try_into().unwrap() => true ; "when providing ipn node id")]
-    #[test_case("ipn:1.1".try_into().unwrap() => false ; "when providing full ipn address")]
+    #[test_case("ipn:977123.1.0".try_into().unwrap() => true ; "when providing ipn node id")]
+    #[test_case("ipn:978123.1.1".try_into().unwrap() => false ; "when providing full ipn address")]
     #[test_case("dtn://node1".try_into().unwrap() => true ; "when providing dtn node id")]
     #[test_case("dtn://node1/incoming".try_into().unwrap() => false ; "when providing full dtn address")]
     #[test_case("dtn:none".try_into().unwrap() => false ; "when providing none endpoint")]
     fn is_node_id_tests(eid: EndpointID) -> bool {
-        eid.is_node_id()
+        eid.is_administrative_endpoint()
     }
 
-    #[test_case("ipn:1.0".try_into().unwrap() => Some("1".to_string()))]
+    #[test_case("ipn:978123.1.0".try_into().unwrap() => Some("1".to_string()))]
     #[test_case("dtn://node1/incoming".try_into().unwrap() => Some("node1".to_string()))]
     #[test_case("dtn://node1".try_into().unwrap() => Some("node1".to_string()))]
     #[test_case("dtn://home_net/~tele/sensors/temperature".try_into().unwrap() => Some("home_net".to_string()))]
@@ -531,8 +569,8 @@ mod tests {
     #[test_case("dtn://node1".try_into().unwrap() => None)]
     #[test_case("dtn://node_group/~mail".try_into().unwrap() => Some("~mail".to_string()))]
     #[test_case("dtn://home_net/~tele/sensors/temperature".try_into().unwrap() => Some("~tele/sensors/temperature".to_string()))]
-    #[test_case("ipn:23.42".try_into().unwrap() => Some("42".to_string()))]
-    #[test_case("ipn:23.0".try_into().unwrap() => None)]
+    #[test_case("ipn:0.23.42".try_into().unwrap() => Some("42".to_string()))]
+    #[test_case("ipn:0.23.0".try_into().unwrap() => None)]
     fn service_part_tests(eid: EndpointID) -> Option<String> {
         eid.service_name()
     }
